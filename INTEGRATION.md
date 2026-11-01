@@ -92,15 +92,16 @@ correlation / precision / covariance entries, row-major.
 (when upstream provides it).
 
 **Matrix entry records (Books 3/4)** — Chapter = i+1; Section = 1 in
-the D lane, j+1 in the R lane; per-field Scroll: 1=value, 2=ic, 3=se,
-4=i (0-based), 5=j (0-based), 6=kind. The `ic` field is the entry's
-associated |correlation|: for `correlation`, |value|; for
-`covariance`, |corr_ij|; for `precision`, |corr_ij| of the implied
-covariance Λ⁻¹ (1.0 on the diagonal). `se` is the Fisher SE
-1/√(n−3) when a sample size is known, else the text `nan`. Floats are
-stored via `repr()`, which round-trips float64 exactly — that is what
-makes the 1e-12 reconstruction tolerances in the tests honest (the
-seeded 4×4 demo reconstructs with error exactly 0.0).
+the D lane, j+1 in the R lane; per-field Scroll: 1=value,
+2=ic_marginal, 3=se, 4=i (0-based), 5=j (0-based), 6=kind, and —
+**schema 2 (additive)** — 7=ic_conditional, 8=partial_corr (signed),
+9=marginal_corr (signed). Fields 1–6 are byte-identical to schema 1
+for identical inputs; field 2 is now *documented* as what it always
+stored, the marginal coupling (§8). `se` is the Fisher SE 1/√(n−3)
+when a sample size is known, else the text `nan`. Floats are stored
+via `repr()`, which round-trips float64 exactly — that is what makes
+the 1e-12 reconstruction tolerances in the tests honest (the seeded
+4×4 demo reconstructs with error exactly 0.0).
 
 **Book 5** — Chapter = window#+1, §1: 1=ic, 2=window_center,
 3=is_max (`true`/`false`).
@@ -116,7 +117,9 @@ scrolls and re-quoted on export (tested explicitly).
 
 **Book 7** — Ch.1 §1: 1=upstream CF version (or `n/a`), 2=UTC
 timestamp, 3=source description, 4=cf_phext version, 5=detail
-(model_type/method, matrix kind, or the SHA-256 of an imported CSV).
+(model_type/method, matrix kind, or the SHA-256 of an imported CSV),
+6=**schema version** (`2`; absent in schema 1 files, whose readers
+treat absence as `1`).
 
 For a `diagnose` volume, the D/R lanes hold the **precision**
 decomposition of the pair (Λ from the inverse correlation matrix) —
@@ -160,6 +163,18 @@ tests) is pure Python and never requires it. Operational note,
 evidenced with SQ v0.6.0: do not replace a hosted `.phext` file while
 its daemon is running — shut the daemon down first.
 
+**What is SQ-verified, exactly (2026-11-01, SQ v0.6.0):** for
+coordinates whose components are all ≤ 999, `sq select` agrees with
+the built-in reader — in the integration test (small matrix phext,
+clean sequential run: PASS) and in manual probes against the full
+simulations phext (values spot-checked across all 8 volumes).
+**What is NOT SQ-verified:** coordinates with a component ≥ 1000 —
+libphext saturates components at 999 (§5), so dataset rows ≥ 998 are
+not SQ-addressable in this schema; and scripted SQ daemon startup on
+a shared machine proved intermittent (the test reports SKIP with the
+daemon's log when the daemon does not start; see §5). No claim in
+this document rests on SQ behaving beyond that envelope.
+
 ## 5. Limitations (only those derived or evidenced)
 
 - **Delimiter bytes cannot appear in scroll text.** Derived from the
@@ -187,6 +202,25 @@ its daemon is running — shut the daemon down first.
 - **The `diagnose` precision lane uses Λ = corr⁻¹.** For a pair this
   is the natural 2×2 precision; for multivariate diagnoses a user
   should store their model precision via `matrix_to_phext` instead.
+- **SQ/libphext caps coordinate components at 999 (evidenced).**
+  On a synthetic phext with scrolls at Chapters 999/1000/1001, SQ's
+  TOC lists one scroll (at 999, holding the last-written value) and
+  selects at ≥1000 return empty. This schema's dataset lane puts row
+  r at Chapter r+2, so SQ interop covers only the first ~997 data
+  rows of each dataset volume. Neither `cf_phext` nor the reference
+  dead-reckoning parser imposes this cap, and every non-SQ test
+  covers the full range. Repacking rows to respect 999 would change
+  existing coordinates; it is a question for the maintainer (§8),
+  not a silent change.
+- **Schema 1 files do not store the signed marginal correlation.**
+  Only its magnitude (field 2) was recorded, so
+  `coupling_from_phext` returns `marginal_corr=None` for schema 1
+  rather than reconstructing a sign the file does not contain.
+  (The conditional values *are* derivable for schema 1, from the
+  stored matrix values — see §8.)
+- **Point queries are full parses in `cf_phext` (measured, §9).**
+  Addressability is not yet random access; an index changes that
+  (prototype results in §9), but `cf_phext` does not ship one.
 - **No native Julia phext implementation yet.** Julia results enter
   via CSV today (PHEXT.md shows how). The format spec needed to write
   one is §1–2 of this document plus the in-file manifest.
@@ -195,12 +229,19 @@ its daemon is running — shut the daemon down first.
 
 Additive only — **no upstream files modified**:
 
-- `python/cf_phext.py` (this module, unchanged; its upstream-module
-  lookup finds the sibling `circulatory_fidelity.py` first)
-- `python/test_cf_phext.py` (the SQ test self-skips if `sq` is
-  absent; the reference-parser agreement test self-skips if
-  `parse_phext.py` isn't available outside the phext project)
+- `python/cf_phext.py` (this module; its upstream-module lookup
+  finds the sibling `circulatory_fidelity.py` first)
+- `python/test_cf_phext.py` (the SQ test self-skips, with its
+  daemon's log, if `sq` is absent or cannot start; the
+  reference-parser agreement test self-skips if `parse_phext.py`
+  isn't available outside the phext project)
+- `python/demo.py` (the end-to-end demo, repo layout)
+- `python/fixtures/schema1_chain.phext` (a schema-1 file generated
+  by cf_phext 1.0.0, used by the backward-compatibility test)
+- `verify.sh` at repo root (upstream suite + integration tests +
+  demo, repo-relative, with an SQ preflight line)
 - `PHEXT.md` at repo root (short README-style section + quickstart)
+- `INTEGRATION.md` at repo root (this document)
 
 `CITATION.cff`, `LICENSE`, the paper, Julia sources, notebooks and
 figures are untouched, and CF's authorship/citation are credited, not
@@ -215,6 +256,116 @@ bash verify.sh
 ```
 
 runs upstream's own `test_circulatory_fidelity.py`, then
-`test_cf_phext.py` (8 tests), then `demo.py`, then prints SHA-256
+`test_cf_phext.py` (14 tests), then `demo.py`, then prints SHA-256
 hashes of the generated phexts. Fresh-copy cost: the three commands
-above, nothing to install beyond CF's existing numpy/scipy.
+above, nothing to install beyond CF's existing numpy/scipy. The repo
+copy has its own `verify.sh` with the same contents in repo layout;
+both print an SQ preflight line and count PASS / SKIP / FAIL
+separately (a skip is not a pass).
+
+## 8. Marginal vs conditional coupling (schema 2)
+
+Schema 1 stored, in each matrix-entry record, a *value* from one
+matrix alongside an *IC* computed from a different (associated)
+matrix, without saying so. For kind=precision the value is an entry
+of Λ — a **conditional**-dependence quantity (in a Gaussian
+graphical model, Λ_ij = 0 iff variables i, j are conditionally
+independent given all the rest) — while the `ic` field was
+|corr_ij| of the implied covariance Λ⁻¹ — a **marginal** quantity
+that includes dependence mediated by other variables. Neither is
+wrong; they answer different questions, and a record that mixes them
+unlabelled invites misreading.
+
+The canonical example is a three-variable Gaussian chain A–B–C with
+
+```
+Σ = [[1, .6, .36], [.6, 1, .6], [.36, .6, 1]]   (marginal correlations)
+Λ = Σ⁻¹ = [[1.5625, -.9375, 0], [-.9375, 2.125, -.9375], [0, -.9375, 1.5625]]
+```
+
+- corr(A, C) = **0.36** — yet A and C are conditionally independent
+  given B: Λ_AC = 0, so the partial correlation
+  ρ_AC·B = −Λ_AC/√(Λ_AA·Λ_CC) = **0**. The 0.36 is entirely the
+  indirect path through B (0.6 × 0.6).
+- ρ_AB·C = 0.9375/√(1.5625·2.125) = **0.5144957554…**, which differs
+  from the marginal corr(A, B) = 0.6.
+- In two variables the two notions coincide (there is nothing else
+  to condition on): for ρ = 0.8 both are 0.8. The distinction only
+  exists in dimension ≥ 3 — which is exactly where a stored matrix
+  stops being "a pair".
+
+**Schema 2 (additive, backward-compatible)** makes both explicit
+per entry record: field 2 keeps its schema-1 value and is now
+documented as `ic_marginal`; field 7 adds `ic_conditional`
+= |partial_ij|; field 8 adds the signed `partial_corr`; field 9 adds
+the signed `marginal_corr`. Every volume stamps its schema version
+at Book 7 Scroll 6 (`2`); a missing stamp means schema 1.
+`coupling_from_phext(path, volume, i, j)` returns both couplings for
+either schema — for schema 1 files it *derives* the conditional
+values from the stored matrix values (directly from Λ for
+kind=precision; via one read-time inverse otherwise) and returns
+`marginal_corr=None`, because schema 1 never stored the sign and we
+do not invent data. A schema-1 fixture generated by the original
+code (`fixtures/schema1_chain.phext`, the chain's Λ) is in the test
+suite as the compatibility evidence.
+
+Why field 2 stays marginal: **upstream CF's pairwise IC is a
+marginal quantity by design** — `inference_coupling(x, y)` is a
+copula correlation of a pair of sample vectors; there is no
+conditioning set. Redefining field 2 to a conditional quantity
+would silently change CF's diagnostic, which this integration must
+not do. Conditional coupling is offered as additional, labelled
+information.
+
+Two cautions, stated plainly: partial correlation is still a
+*correlation* — neither marginal nor conditional dependence implies
+causation, and a zero partial correlation is conditional
+independence only under the Gaussian (graphical-model) reading.
+And a question we explicitly leave to Aaron: **whether conditional
+IC deserves to be a first-class CF diagnostic** (e.g. an
+`inference_coupling_conditional` in upstream, with its own
+thresholds and validation) is a scientific decision for the
+maintainer. This PR only makes the stored semantics explicit; it
+does not propose new CF theory.
+
+**Cost (measured, `perf_coupling.py`; medians, numpy 1.26.4, this
+machine).** One of the two paths needs a dense inverse; which one
+depends on the input kind, symmetrically. For kind=precision,
+marginal = inverse + normalize, conditional = normalize only (the
+`partial_correlations(Λ, 'precision')` path provably performs no
+inverse — there is a regression test that monkeypatches
+`np.linalg.inv` to raise). For kind=correlation, the costs swap.
+
+| d | precision: marginal | precision: conditional | correlation: marginal | correlation: conditional |
+|--:|--------------------:|-----------------------:|----------------------:|-------------------------:|
+| 10 | 0.014 ms | 0.009 ms | 0.001 ms | 0.015 ms |
+| 50 | 0.154 ms | 0.013 ms | 0.001 ms | 0.157 ms |
+| 100 | 0.996 ms | 0.024 ms | 0.002 ms | 1.004 ms |
+| 200 | 7.384 ms | 0.088 ms | 0.008 ms | 7.385 ms |
+| 400 | 57.424 ms | 0.336 ms | 0.059 ms | 56.835 ms |
+
+Honest reading: below d ≈ 50 every path is under ~0.16 ms and the
+distinction is cost-irrelevant; at d = 400 the inverse-carrying path
+costs ~57 ms against ~0.3 ms (precision inputs) — material if a
+caller needs *only* conditional coupling of a large precision
+matrix, which is why the no-inverse entry points exist. Inside
+`_write_matrix_lanes` both couplings are written and the inverse is
+computed exactly once per call, as in schema 1.
+
+## 9. Storage performance evidence (summary)
+
+Full method and numbers: `BENCHMARK.md` in the integration bundle
+(workspace-only; not part of the PR). Headlines from the final run,
+on the simulations phext (249,832 scroll slots, identical seeded
+255-query set, all answers verified): serialized size is a wash
+(phext 3,634,939 B vs CSV 3,630,327 B, 1.001×); the current
+`read_scroll` costs a full parse per query (median 385 ms) versus
+CSV parse-per-query 12 ms; a prototype coordinate→(offset, length)
+index built in 1.97 s (~64 MB traced) answers the same queries in a
+median of 8.6 µs; full scans still favour bulk parsing (CSV 0.15 s,
+phext load+walk 0.45 s); a one-field update costs a whole-file
+rewrite in both (CSV 10 ms for its 0.76 MB file; phext 1.12 s for
+3.63 MB). Conclusion recorded there: addressability is not yet
+random access in `cf_phext`; the indexed-reader follow-up is
+justified by measurement, and no speed claim is made for the
+current implementation.

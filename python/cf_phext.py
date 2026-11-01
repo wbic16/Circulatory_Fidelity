@@ -55,7 +55,14 @@ from pathlib import Path
 
 import numpy as np
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
+
+# Phext storage schema version written by this module. Schema 1 files
+# (written by cf_phext 1.0.0) have matrix-entry fields 1-6 only and no
+# Book 7 Scroll 6; schema 2 adds fields 7-9 (conditional coupling) and
+# stamps the version at Book 7 Scroll 6 of every volume. Readers treat
+# a missing Book 7 Scroll 6 as schema "1" (see coupling_from_phext).
+SCHEMA_VERSION = "2"
 
 # ---------------------------------------------------------------------------
 # Phext core: delimiters, coordinates, serialize/parse
@@ -273,15 +280,45 @@ kind's layout below.
     9=se_per_window (may be absent)
 
 Matrix entry records (Books 3 and 4), per-field Scroll:
-  1=value 2=ic 3=se 4=i (0-based) 5=j (0-based) 6=kind
+  1=value 2=ic_marginal 3=se 4=i (0-based) 5=j (0-based) 6=kind
+  7=ic_conditional 8=partial_corr (signed) 9=marginal_corr (signed)
+  (Fields 7-9 exist only in schema 2 files; see 'Schema versions'.)
   D lane (Book 3): Chapter=i+1, Section=1, diagonal entries only (i==j).
   R lane (Book 4): Chapter=i+1, Section=j+1, off-diagonal only (i!=j).
-  'ic' field: for kind=correlation, |value|; for kind=covariance,
-  |corr_ij|; for kind=precision, |corr_ij| of the implied covariance
-  inv(Lambda) (for the pair (i,j); 1.0 on the diagonal).
+  MARGINAL vs CONDITIONAL coupling (schema 2): two different relational
+  properties, stored separately, never mixed in one field.
+  Field 2 'ic_marginal' and field 9 'marginal_corr' describe MARGINAL
+  dependence: field 9 is the signed correlation corr_ij of the pair
+  (for kind=correlation, the entry itself; for kind=covariance, the
+  normalized covariance; for kind=precision, corr_ij of the implied
+  covariance inv(Lambda)); field 2 is its magnitude. Marginal
+  correlation can be entirely indirect: in the chain A-B-C with
+  corr(A,B)=corr(B,C)=0.6, corr(A,C)=0.36 although A and C are
+  conditionally independent given B. Upstream CF's pairwise IC is a
+  marginal (copula) quantity by design; field 2 has stored exactly
+  that since schema 1, and keeps that meaning.
+  Field 7 'ic_conditional' and field 8 'partial_corr' describe
+  CONDITIONAL dependence: the partial correlation of the pair given
+  all other variables, partial_ij = -Lambda_ij/sqrt(Lambda_ii *
+  Lambda_jj) from the precision matrix Lambda (for kind=precision,
+  the stored matrix itself; otherwise inv of the stored matrix).
+  In a Gaussian graphical model the precision matrix encodes
+  conditional independence: Lambda_ij = 0 iff the pair is
+  conditionally independent given the rest. For the chain above,
+  partial(A,C) = 0 while marginal(A,C) = 0.36. On the diagonal both
+  couplings are 1.0 by convention. Neither marginal nor conditional
+  dependence is causation.
   'se' field: Fisher SE 1/sqrt(n-3) when a sample size n is known,
   otherwise the text 'nan'.
   Floats are stored with repr(), which round-trips float64 exactly.
+
+Schema versions: Book 7 Scroll 6 (below) records the schema version
+of each volume ('2' for files written by cf_phext >= 1.1.0). Files
+without fields 7-9 and without Book 7 Scroll 6 are schema 1; their
+conditional coupling is not stored but can be derived at read time
+from the stored value fields (see coupling_from_phext in cf_phext.py;
+the signed marginal correlation is NOT stored in schema 1 and cannot
+be recovered from the entry record alone).
 
 Book 5 (windowed series): Chapter=window_index+1, Section=1, Scroll:
   1=ic 2=window_center 3=is_max ('true'/'false')
@@ -297,6 +334,7 @@ Book 7 (provenance), Chapter 1, Section 1, Scroll:
   1=upstream CF version (or 'n/a') 2=UTC timestamp (ISO 8601)
   3=source description 4=cf_phext version 5=detail (model_type/method,
   matrix kind, or SHA-256 of an imported CSV)
+  6=schema version ('2'; ABSENT in schema 1 files — absence means '1')
 
 Thresholds (filtering): IC <0.25 safe, 0.25-0.35 weak, 0.35-0.55
 moderate, 0.55-0.70 strong, >0.70 structured inference required.
@@ -327,6 +365,7 @@ def _stamp_meta(doc, volume, kind, label, counts, provenance_detail, cf_version,
     doc.set_a(volume, BOOK_PROVENANCE, 1, 1, 3, source)
     doc.set_a(volume, BOOK_PROVENANCE, 1, 1, 4, __version__)
     doc.set_a(volume, BOOK_PROVENANCE, 1, 1, 5, provenance_detail)
+    doc.set_a(volume, BOOK_PROVENANCE, 1, 1, 6, SCHEMA_VERSION)
 
 
 def _open_doc(path, volume):
@@ -416,7 +455,14 @@ def load_cf(cf_module_path=None):
 # Matrix decomposition -> phext (Books 3 + 4)
 # ---------------------------------------------------------------------------
 def _associated_corr(matrix: np.ndarray, kind: str) -> np.ndarray:
-    """Correlation matrix associated with `matrix` (for the ic field)."""
+    """Marginal correlation matrix associated with `matrix`.
+
+    This is the correlation whose magnitude field 2 (ic_marginal) has
+    always stored: for kind=correlation the matrix itself, for
+    kind=covariance the normalized covariance, for kind=precision the
+    correlation of the implied covariance inv(Lambda). Marginal
+    correlation includes indirect dependence (see partial_correlations
+    for the conditional counterpart)."""
     M = np.asarray(matrix, dtype=np.float64)
     if kind == "correlation":
         return M.copy()
@@ -430,12 +476,83 @@ def _associated_corr(matrix: np.ndarray, kind: str) -> np.ndarray:
     raise ValueError(f"unknown matrix kind: {kind!r}")
 
 
+def _partial_from_precision(P: np.ndarray) -> np.ndarray:
+    """Signed partial correlations from a precision matrix P:
+    partial_ij = -P_ij / sqrt(P_ii * P_jj) for i != j; 1.0 on the
+    diagonal by convention. Pure normalization — NO matrix inverse."""
+    d = np.sqrt(np.diag(P))
+    partial = -P / np.outer(d, d)
+    np.fill_diagonal(partial, 1.0)
+    return partial
+
+
+def partial_correlations(matrix: np.ndarray, kind: str = "precision") -> np.ndarray:
+    """Signed partial (conditional) correlation matrix for `matrix`.
+
+    partial_ij is the correlation of variables i and j conditioned on
+    all remaining variables. In a Gaussian graphical model it is read
+    off the precision matrix Lambda: partial_ij =
+    -Lambda_ij / sqrt(Lambda_ii * Lambda_jj).
+
+    Cost note: for kind='precision' the input IS Lambda, so this is a
+    normalization only and performs NO matrix inversion. For
+    kind='correlation'/'covariance', Lambda = inv(matrix) is required
+    and exactly one inverse is computed. The dual holds for marginal
+    correlations: direct for correlation/covariance inputs, one
+    inverse for precision inputs."""
+    M = np.asarray(matrix, dtype=np.float64)
+    if M.ndim != 2 or M.shape[0] != M.shape[1]:
+        raise ValueError("matrix must be square 2D")
+    if kind == "precision":
+        P = M
+    elif kind in ("correlation", "covariance"):
+        P = np.linalg.inv(M)
+    else:
+        raise ValueError(f"unknown matrix kind: {kind!r}")
+    return _partial_from_precision(P)
+
+
+def conditional_ic(matrix: np.ndarray, kind: str = "precision") -> np.ndarray:
+    """|partial correlation| matrix — the conditional counterpart of
+    CF's (marginal) Inference Coupling. See partial_correlations for
+    the definition and cost notes; for kind='precision' no inverse is
+    performed."""
+    return np.abs(partial_correlations(matrix, kind))
+
+
+# Backwards-compatible alias matching the module's naming style.
+marginal_correlations = _associated_corr
+
+
+def _corr_and_precision(M: np.ndarray, kind: str):
+    """(marginal corr, precision) for a stored matrix, computing the
+    dense inverse EXACTLY ONCE regardless of kind:
+      precision:   corr needs inv(M); the precision is M itself.
+      covariance:  corr is a normalization of M; precision is inv(M).
+      correlation: corr is M itself;      precision is inv(M)."""
+    if kind == "precision":
+        cov = np.linalg.inv(M)
+        d = np.sqrt(np.diag(cov))
+        return cov / np.outer(d, d), M
+    if kind == "covariance":
+        d = np.sqrt(np.diag(M))
+        return M / np.outer(d, d), np.linalg.inv(M)
+    if kind == "correlation":
+        return M.copy(), np.linalg.inv(M)
+    raise ValueError(f"unknown matrix kind: {kind!r}")
+
+
 def _write_matrix_lanes(doc, volume, matrix, kind, n=None):
     M = np.asarray(matrix, dtype=np.float64)
     if M.ndim != 2 or M.shape[0] != M.shape[1]:
         raise ValueError("matrix must be square 2D")
     dim = M.shape[0]
-    corr = _associated_corr(M, kind)
+    # One inverse total (see _corr_and_precision): schema 1 computed the
+    # marginal correlations with the same single inverse for
+    # kind=precision and none for the other kinds; fields 1-6 below are
+    # byte-identical to schema 1 for identical inputs.
+    corr, prec = _corr_and_precision(M, kind)
+    partial = _partial_from_precision(prec)
     se_text = _f(1.0 / np.sqrt(n - 3)) if (n is not None and n > 3) else "nan"
     D = np.diag(np.diag(M))
     R = M - D
@@ -450,6 +567,10 @@ def _write_matrix_lanes(doc, volume, matrix, kind, n=None):
             doc.set_a(*base, 4, str(i))
             doc.set_a(*base, 5, str(j))
             doc.set_a(*base, 6, kind)
+            # Schema 2 (additive): conditional coupling, explicitly.
+            doc.set_a(*base, 7, _f(abs(partial[i, j])))
+            doc.set_a(*base, 8, _f(partial[i, j]))
+            doc.set_a(*base, 9, _f(corr[i, j]))
     # Summary scrolls for the matrix volume.
     offdiag_abs = np.abs(R)
     if dim > 1:
@@ -518,6 +639,101 @@ def matrix_from_phext(path, volume=None) -> np.ndarray:
     """Reconstruct the full matrix D + R from a phext volume."""
     D, R = decomposition_from_phext(path, volume)
     return D + R
+
+
+def schema_version_of(doc: PhextDoc, volume) -> str:
+    """Schema version of a volume: Book 7 Scroll 6, or '1' if absent
+    (schema 1 files predate the stamp)."""
+    return doc.get_a(volume, BOOK_PROVENANCE, 1, 1, 6) or "1"
+
+
+def coupling_from_phext(path, volume, i, j) -> dict:
+    """Read one matrix entry's coupling record from a phext volume.
+
+    Returns a dict with keys:
+      value           the stored matrix entry (field 1)
+      ic_marginal     |marginal corr_ij| (field 2; CF's pairwise IC
+                      for this pair — a marginal quantity by design)
+      ic_conditional  |partial corr_ij| (field 7, schema 2; derived
+                      from the stored values for schema 1 files)
+      partial_corr    signed partial correlation (field 8 / derived)
+      marginal_corr   signed marginal correlation (field 9, schema 2;
+                      None for schema 1 — the sign was not stored)
+      se              Fisher SE stored in field 3 (float; nan if the
+                      writer knew no sample size)
+      kind            'precision' | 'correlation' | 'covariance'
+      schema_version  '2' if the volume carries fields 7-9 / the
+                      Book 7 Scroll 6 stamp, else '1'
+      notes           list of derivation/limitation notes (schema 1)
+
+    Schema-1 derivation: the reconstructed matrix Mat = D + R is the
+    stored matrix. If kind is 'precision', Mat IS the precision matrix
+    and partial_ij = -Mat_ij/sqrt(Mat_ii*Mat_jj) directly. If kind is
+    'correlation'/'covariance', the precision is inv(Mat) (one
+    read-time inverse). The signed marginal correlation cannot be
+    derived from a schema-1 entry record (only its magnitude was
+    stored), so marginal_corr is None there rather than a guess."""
+    doc = PhextDoc.load(path)
+    if volume is None:
+        raise ValueError("coupling_from_phext requires an explicit volume")
+    i, j = int(i), int(j)
+    book = BOOK_D if i == j else BOOK_R
+    section = 1 if i == j else j + 1
+    base = (volume, book, i + 1, section)
+
+    def _get(scroll):
+        return doc.get_a(*base, scroll)
+
+    kind = _get(6)
+    if kind is None:
+        raise ValueError(
+            f"no matrix entry record at volume {volume}, i={i}, j={j}")
+    value = float(_get(1))
+    ic_marginal = float(_get(2))
+    se_text = _get(3)
+    se = float(se_text) if se_text is not None else float("nan")
+    schema = schema_version_of(doc, volume)
+    notes = []
+    if _get(7) is not None:
+        ic_conditional = float(_get(7))
+        partial_corr = float(_get(8))
+        marginal_corr = float(_get(9))
+    else:
+        # Schema 1: derive conditional coupling from stored values.
+        Mat = matrix_from_phext(path, volume)
+        if kind == "precision":
+            P = Mat
+        else:
+            P = np.linalg.inv(Mat)
+            notes.append(
+                "ic_conditional derived at read time via one inverse of "
+                "the reconstructed stored matrix (schema 1 stores no "
+                "conditional fields)")
+        if i == j:
+            partial_corr = 1.0
+        else:
+            partial_corr = float(-P[i, j] / np.sqrt(P[i, i] * P[j, j]))
+        ic_conditional = abs(partial_corr)
+        marginal_corr = None
+        notes.append(
+            "marginal_corr (signed) is not stored in schema 1; only "
+            "its magnitude (ic_marginal) was recorded, so the sign is "
+            "reported as None rather than reconstructed")
+        if schema == "1":
+            notes.append("schema 1 file: fields 7-9 absent; conditional "
+                         "values derived from the stored value fields")
+    return {
+        "value": value,
+        "ic_marginal": ic_marginal,
+        "ic_conditional": ic_conditional,
+        "partial_corr": partial_corr,
+        "marginal_corr": marginal_corr,
+        "marginal_corr_signed": marginal_corr,
+        "se": se,
+        "kind": kind,
+        "schema_version": schema,
+        "notes": notes,
+    }
 
 
 # ---------------------------------------------------------------------------

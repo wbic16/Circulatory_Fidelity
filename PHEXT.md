@@ -63,6 +63,22 @@ below).
 files. Phext is storage and addressing only — CF's numbers go in,
 the same numbers come out, now with addresses.
 
+**Marginal vs conditional coupling (schema 2).** A matrix entry's
+value and its correlation are different kinds of statement, and
+schema 2 stores both, labelled. In a chain A–B–C with correlations
+0.6, 0.6, the marginal corr(A, C) is 0.36 — but Λ_AC = 0, so A and C
+are conditionally independent given B (partial correlation 0). Each
+entry record therefore carries `ic_marginal` (field 2, the quantity
+schema 1 always stored, and the marginal pairwise IC CF defines)
+alongside `ic_conditional` / signed `partial_corr` (fields 7–8,
+partial_ij = −Λ_ij/√(Λ_ii·Λ_jj)) and the signed `marginal_corr`
+(field 9). `coupling_from_phext(path, volume, i, j)` reads both —
+including from schema 1 files, where the conditional values are
+derived from the stored matrix and the signed marginal is honestly
+reported as not stored. Neither quantity is causation; whether
+conditional IC should become a CF diagnostic proper is Aaron's
+call, not this integration's (see INTEGRATION.md §8).
+
 ### The enhancement, as a diagram
 
 ```mermaid
@@ -223,9 +239,13 @@ summary and the manifest scroll embedded in every file).
 - `python/cf_phext.py` — the module (writer/reader + CF bridges + CLI)
 - `python/test_cf_phext.py` — tests (parser agreement with the
   reference phext parser, D+R reconstruction, diagnose round-trip,
-  CSV round-trips, UTF-8 validity, SQ interop)
-- `INTEGRATION.md` (in the integration bundle) — full design +
-  coordinate map
+  CSV round-trips, UTF-8 validity, marginal vs conditional coupling,
+  schema-1 backward compatibility, SQ interop)
+- `python/demo.py` — the end-to-end demo
+- `python/fixtures/schema1_chain.phext` — a schema-1 file written by
+  cf_phext 1.0.0, kept as backward-compatibility evidence
+- `verify.sh` — upstream suite + integration tests + demo (repo root)
+- `INTEGRATION.md` — full design + coordinate map + schema-2 notes
 
 ## Verify
 
